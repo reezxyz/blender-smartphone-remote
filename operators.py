@@ -15,7 +15,7 @@ import json
 import bpy
 import mathutils
 from .arcore import ArCoreInterface, ArEventHandler
-from . import environment
+from . import environment, stream
 import queue
 from mathutils import Matrix, Vector
 
@@ -309,7 +309,7 @@ class RemoteStartOperator(bpy.types.Operator):
         bpy.ops.wm.modal_executor_operator()
         bpy.app.handlers.frame_change_post.append(record)
 
-
+        stream.enable()
         return {'FINISHED'}
 
 
@@ -329,6 +329,7 @@ class RemoteStopOperator(bpy.types.Operator):
         bpy.app.handlers.frame_change_post.remove(record)
         # bpy.app.timers.unregister(execute_queued_functions)
 
+        stream.disable()
         return {'FINISHED'}
 
 
