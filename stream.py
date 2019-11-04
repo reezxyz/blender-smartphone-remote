@@ -2,21 +2,24 @@ import bpy
 import bgl
 import gpu
 from gpu_extras.presets import draw_texture_2d
+import ffmpeg
+from PIL import Image
+
+IMAGE_NAME = "Generated Image"
 
 WIDTH = 512
 HEIGHT = 256
 
 offscreen = None
 handler = None
-buffer = bgl.Buffer(bgl.GL_BYTE, WIDTH * HEIGHT * 4)
+buffer = bgl.Buffer(bgl.GL_BYTE, WIDTH * HEIGHT * 3)
 
 def buffer_print():
     global buffer
-    sliceBuffer = buffer[0:16]
-    print(sliceBuffer)
-
-
-    return 2
+    # img = Image.frombytes('RGBA', (WIDTH, HEIGHT),buffer)
+    # img.save('test.jpg','JPEG')
+    # print(buffer)
+    return 20
 
 def draw():
     global offscreen, buffer
@@ -41,7 +44,13 @@ def draw():
     draw_texture_2d(offscreen.color_texture, (10, 10), WIDTH, HEIGHT)
     with offscreen.bind():
         bgl.glReadBuffer(bgl.GL_BACK)
-        bgl.glReadPixels(0, 0, WIDTH, HEIGHT, bgl.GL_RGBA, bgl.GL_UNSIGNED_BYTE, buffer)
+        bgl.glReadPixels(0, 0, WIDTH, HEIGHT, bgl.GL_RGB, bgl.GL_UNSIGNED_BYTE, buffer)
+        
+        # if not IMAGE_NAME in bpy.data.images:
+        #     bpy.data.images.new(IMAGE_NAME, WIDTH, HEIGHT)
+        # image = bpy.data.images[IMAGE_NAME]
+        # image.scale(WIDTH, HEIGHT)
+        # image.pixels = [v / 255 for v in buffer]
     # bgl.glGetTexImage(offscreen.color_texture,0, bgl.GL_RGBA, bgl.GL_UNSIGNED_BYTE, buffer)
     
 
@@ -51,7 +60,7 @@ def enable():
     offscreen = gpu.types.GPUOffScreen(WIDTH, HEIGHT)
     
     handler = bpy.types.SpaceView3D.draw_handler_add(draw, (), 'WINDOW', 'POST_PIXEL')
-    bpy.app.timers.register(buffer_print)
+    # bpy.app.timers.register(buffer_print)
     
 
 def disable():
@@ -60,5 +69,5 @@ def disable():
     if handler:
         bpy.types.SpaceView3D.draw_handler_remove(handler, 'WINDOW')
 
-    bpy.app.timers.unregister(buffer_print)
+    # bpy.app.timers.unregister(buffer_print)
     offscreen.free()

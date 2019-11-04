@@ -99,6 +99,7 @@ class ArEventHandler():
         self._frameListeners = []
         self._getScene = None
         self._record = None
+        self._vstream = None
 
     def bindOnFrameReceived(self,f):
         self._frameListeners.append(f)
@@ -108,6 +109,9 @@ class ArEventHandler():
 
     def bindRecord(self, f):
         self._record = f
+
+    def bindViewportStream(self, f):
+        self._vstream = f
 
     def OnFrameReceived(self, frame):
         for f in self._frameListeners:
@@ -126,6 +130,12 @@ class ArEventHandler():
         else:
             raise Exception('GetScene not implemented !')
 
+    def OnViewPortStream(self):
+        if self._vstream:
+            return self._vstream()
+        else:
+            log.info("Viewport streaming not implemented")
+            return None
 
 class ArCoreInterface(object):
     """ Application Ar interface
@@ -241,6 +251,11 @@ class AppLink(threading.Thread):
 
                     self.command_socket.send(identity, zmq.SNDMORE)
                     self.command_socket.send_multipart(response)
+                elif command[1] == b"VSTREAM":
+                    stream = self.handler.OnViewPortStream()
+                    self.command_socket.send(identity, zmq.SNDMORE)
+                    self.command_socket.send(umsgpack.packb(stream))
+                    print('done')
                 else:
                     log.error("Wrong request")
 

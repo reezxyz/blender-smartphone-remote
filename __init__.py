@@ -21,6 +21,8 @@ from . import environment
 DEPENDENCIES = {
     "zmq",
     "umsgpack",
+    "ffmpeg",
+    "PIL"
 }
 
 

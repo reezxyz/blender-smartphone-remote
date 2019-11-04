@@ -93,6 +93,7 @@ def apply_ar_frame(frame):
     if frame.mode == "OBJECT":
          run_in_main_thread(apply_object_pose,frame)
 
+
 def apply_object_pose(frame):
     """Apply frame blender pose into blender select object"""
     global is_recording
@@ -192,6 +193,9 @@ def record_camera(status):
     return blender_state
 
 
+def viewport_stream():
+    print("streaming viewport")
+    return stream.buffer
 '''
    Scene export
 '''
@@ -302,6 +306,7 @@ class RemoteStartOperator(bpy.types.Operator):
         handler.bindOnFrameReceived(apply_ar_frame)
         handler.bindGetScene(get_cached_scene)
         handler.bindRecord(record_camera)
+        handler.bindViewportStream(viewport_stream)
 
         app = ArCoreInterface(handler)
         app.start()
