@@ -220,11 +220,25 @@ def _apply_pending_frame():
         apply_object_pose(frame)
 
 
-def _compute_pose(frame):
-    bpose = frame.camera.view_matrix * BLENDER
-    worigin = frame.root.world_matrix * BLENDER
-    bpose[3] = (bpose[3] - worigin[3]) * (1 / np.linalg.norm(worigin[1]))
-    return Matrix(bpose.A.tolist())
+def _compute_pose(frame, with_position=True):
+    """
+    Blender matrix of the phone camera (see sr_status.camera_pose).
+
+    Object mode keeps the previous behaviour (old formula).
+    """
+    if not with_position:
+        view = frame.camera.view_matrix
+        root = frame.root.world_matrix
+        bpose = view * BLENDER
+        worigin = root * BLENDER
+        scale = float(np.linalg.norm(worigin[1]))
+        if scale < 1e-9:
+            scale = 1.0
+        bpose[3] = (bpose[3] - worigin[3]) * (1 / scale)
+        return Matrix(bpose.A.tolist())
+
+    return sr_status.camera_pose(frame.camera.view_matrix,
+                                 frame.root.world_matrix)
 
 
 def apply_object_pose(frame):
@@ -232,7 +246,8 @@ def apply_object_pose(frame):
     try:
         active_object = bpy.context.object
         if active_object:
-            active_object.matrix_world = _compute_pose(frame)
+            active_object.matrix_world = _compute_pose(
+                frame, with_position=False)
     except Exception as e:
         log.error("apply object error: {}".format(e))
 
@@ -257,7 +272,9 @@ def apply_camera_pose(frame):
         camera = bpy.context.scene.camera
         if camera:
             camera.matrix_world = _compute_pose(frame)
-            camera.data.angle = frame.camera.intrinsics[0]
+
+            fov = frame.camera.intrinsics[0]
+            camera.data.angle = max(0.01, min(3.1, fov))
 
             if is_recording:
                 camera.keyframe_insert(data_path="location")
@@ -338,7 +355,7 @@ def record_camera(status):
 def export_cached_scene():
     """
     Export the current scene to SCENE_FILE (runs in the main thread),
-    following the export settings of the "Remote > Status & Ekspor" panel.
+    following the export settings of the "Remote > Status & Settings" panel.
 
     Returns the path of the exported file. Raises SceneTooLarge when the
     scene exceeds the configured triangle / file size limits.
@@ -357,8 +374,7 @@ def export_cached_scene():
     t0 = time.time()
 
     # --- 1. how big is the scene? ---------------------------------------
-    tris, per_object = sr_status.count_triangles(cfg.apply_modifiers,
-                                                 cfg.selected_only)
+    tris, per_object = sr_status.count_triangles(cfg.apply_modifiers)
     tris_before = tris
     tris_after = tris
     use_modifiers = cfg.apply_modifiers
@@ -374,13 +390,12 @@ def export_cached_scene():
         if limit and tris > limit:
             if cfg.limit_action == 'BLOCK':
                 raise SceneTooLarge(
-                    "Model terlalu besar: {:,} triangle (batas {:,}). "
-                    "Kecilkan model atau naikkan batas.".format(tris, limit))
+                    "Model is too large: {:,} triangles (limit {:,}). "
+                    "Reduce the model or raise the limit.".format(tris, limit))
 
             # Decimate is a modifier, so modifiers must be evaluated.
             use_modifiers = True
-            tris_before, per_object = sr_status.count_triangles(
-                True, cfg.selected_only)
+            tris_before, per_object = sr_status.count_triangles(True)
             small = sum(t for _, t in per_object if t < DECIMATE_MIN_TRIS)
             big_total = tris_before - small
             tris_after = tris_before
@@ -411,29 +426,30 @@ def export_cached_scene():
             result = bpy.ops.wm.obj_export(
                 filepath=tmp_path,
                 check_existing=False,
-                export_selected_objects=cfg.selected_only,
+                export_selected_objects=False,
                 export_animation=False,
                 apply_modifiers=use_modifiers,
-                export_uv=cfg.export_uv,
-                export_normals=cfg.export_normals,
-                export_triangulated_mesh=cfg.triangulate,
+                export_uv=True,
+                export_normals=True,
+                export_triangulated_mesh=True,
                 export_materials=False,
                 forward_axis='NEGATIVE_Z',
                 up_axis='Y',
-                global_scale=1.0)
+                global_scale=cfg.export_scale)
         else:
             result = bpy.ops.export_scene.obj(
                 filepath=tmp_path,
                 check_existing=False,
-                use_selection=cfg.selected_only,
+                use_selection=False,
                 use_animation=False,
                 use_mesh_modifiers=use_modifiers,
-                use_normals=cfg.export_normals,
-                use_uvs=cfg.export_uv,
-                use_triangles=cfg.triangulate,
+                use_normals=True,
+                use_uvs=True,
+                use_triangles=True,
                 use_materials=False,
                 axis_forward='-Z',
-                axis_up='Y')
+                axis_up='Y',
+                global_scale=cfg.export_scale)
     finally:
         # Always leave the user's scene exactly as it was
         for obj, mod in temp_modifiers:
@@ -459,8 +475,8 @@ def export_cached_scene():
         except OSError:
             pass
         raise SceneTooLarge(
-            "Hasil ekspor {:.0f} MB melebihi batas {} MB. Turunkan batas "
-            "triangle, matikan modifier, atau matikan Normal/UV.".format(
+            "The exported file is {:.0f} MB, above the {} MB limit. Lower "
+            "the triangle limit or turn off Apply modifiers.".format(
                 size_mb, cfg.max_size_mb))
 
     os.replace(tmp_path, final_path)
@@ -486,8 +502,8 @@ def get_cached_scene(offset, chunk_size):
             log.info("export the scene... (chunk_size={})".format(chunk_size))
             sr_status.update(
                 phase="EXPORTING",
-                message="Blender sedang mengekspor scene. Jendela Blender "
-                        "akan membeku sebentar, ini normal.",
+                message="Blender is exporting the scene. The Blender "
+                        "window will freeze briefly, this is normal.",
                 sent_bytes=0, total_bytes=0, size_bytes=0,
                 tris_before=0, tris_after=0, decimated=False)
             t0 = time.time()
@@ -514,14 +530,14 @@ def get_cached_scene(offset, chunk_size):
                 _scene_cache = b""
                 sr_status.update(
                     phase="ERROR",
-                    message="Blender tidak selesai mengekspor dalam {:.0f} "
-                            "detik. Kecilkan model.".format(EXPORT_TIMEOUT))
+                    message="Blender did not finish exporting within {:.0f} "
+                            "seconds. Reduce the model.".format(EXPORT_TIMEOUT))
             except Exception as e:
                 log.error("scene export failed after {:.1f}s: {}".format(
                     time.time() - t0, e))
                 _scene_cache = b""
                 sr_status.update(phase="ERROR",
-                                 message="Ekspor gagal: {}".format(e))
+                                 message="Export failed: {}".format(e))
 
         chunk = _scene_cache[offset:offset + chunk_size]
         total = len(_scene_cache)

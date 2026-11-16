@@ -16,27 +16,32 @@
 # ##### END GPL LICENSE BLOCK #####
 
 """
-Status panel + export settings for the smartphone remote.
+Status panel, export settings and phone-pose decoding for the smartphone remote.
 
-* A thread-safe state dictionary that network threads update and the
-  panel displays (connection, AR frames, scene export / transfer phase).
-* Export settings stored in the scene (triangle budget, size cap, ...).
-* A panel in the sidebar tab "Remote" (View3D > N panel > Remote).
+* A thread-safe state dictionary that network threads update and the panel
+  displays (connection, AR frames, scene export / transfer phase).
+* Settings stored in the scene: export limits and camera options.
+* A panel in the sidebar tab "Remote" (3D Viewport > N panel > Remote).
+* Decoding of the phone camera pose into a Blender camera matrix.
 """
 
 import logging
+import math
 import textwrap
 import threading
 import time
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, IntProperty, PointerProperty
+import numpy as np
+from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
+                       IntProperty, PointerProperty)
+from mathutils import Matrix
 
 log = logging.getLogger(__name__)
 
 CONNECTION_TIMEOUT = 8.0     # seconds without ping => phone considered lost
-HEAVY_MB = 40                # file size flagged as "BERAT"
-MEDIUM_MB = 10               # file size flagged as "Sedang"
+HEAVY_MB = 40                # file size flagged as "HEAVY"
+MEDIUM_MB = 10               # file size flagged as "medium"
 
 
 '''
@@ -68,11 +73,6 @@ _state = dict(
     total_bytes=0,
     send_started=0.0,
     send_seconds=0.0,
-
-    an_time=0.0,             # last manual analysis
-    an_objects=0,
-    an_tris=0,
-    an_modifiers=False,
 )
 
 
@@ -116,57 +116,78 @@ def set_server_running(running):
 
 
 '''
-    Export settings
+    Settings
 '''
 
 
 class SRExportSettings(bpy.types.PropertyGroup):
     apply_modifiers: BoolProperty(
-        name="Terapkan modifier",
-        description="Sertakan hasil modifier (Subdivision, Bevel, ...). "
-                    "Mematikan ini membuat file jauh lebih kecil",
+        name="Apply modifiers",
+        description="Include modifier results (Subdivision, Bevel, ...). "
+                    "Turning this off makes the file much smaller",
         default=False)
-    export_normals: BoolProperty(
-        name="Normal", description="Ekspor normal", default=True)
-    export_uv: BoolProperty(
-        name="UV", description="Ekspor koordinat UV", default=True)
-    triangulate: BoolProperty(
-        name="Triangulasi", description="Ubah semua face menjadi segitiga",
-        default=True)
-    selected_only: BoolProperty(
-        name="Hanya objek terpilih",
-        description="Hanya kirim objek yang sedang dipilih", default=False)
     max_triangles: IntProperty(
-        name="Batas triangle",
-        description="Anggaran triangle untuk dikirim ke HP (0 = tanpa batas)",
+        name="Triangle limit",
+        description="Triangle budget for the model sent to the phone "
+                    "(0 = no limit)",
         default=150000, min=0, soft_max=2000000)
     limit_action: EnumProperty(
-        name="Jika melebihi batas",
+        name="Over the limit",
         items=[
-            ('DECIMATE', "Kecilkan otomatis",
-             "Pakai Decimate sementara agar muat dalam batas "
-             "(scene asli tidak diubah)"),
-            ('BLOCK', "Jangan kirim",
-             "Batalkan dan tampilkan peringatan di Blender"),
+            ('DECIMATE', "Reduce automatically",
+             "Use a temporary Decimate to fit the limit "
+             "(your scene is not changed)"),
+            ('BLOCK', "Do not send",
+             "Cancel and show a warning in Blender"),
         ],
         default='DECIMATE')
     max_size_mb: IntProperty(
-        name="Batas ukuran file (MB)",
-        description="Batalkan pengiriman jika hasil ekspor lebih besar "
-                    "(0 = tanpa batas)",
+        name="Max file size (MB)",
+        description="Cancel the transfer if the exported file is larger "
+                    "(0 = no limit)",
         default=40, min=0)
+    export_scale: FloatProperty(
+        name="Model scale",
+        description="Multiplier for the size of the model sent to the phone",
+        default=1.0, min=0.001, soft_max=100.0, precision=3)
+
+
+class SRCameraSettings(bpy.types.PropertyGroup):
+    position_mode: EnumProperty(
+        name="Phone matrix",
+        description="What the matrix sent by the phone contains",
+        items=[('VIEW', "View matrix (world -> camera)",
+                "The phone sends a view matrix"),
+               ('POSE', "Camera pose (camera -> world)",
+                "The phone sends the camera pose"),
+               ('OFF', "Rotation only", "The camera does not change position")],
+        default='POSE')
+    flip_direction: BoolProperty(
+        name="Flip model direction (180°)",
+        description="Turn the camera 180° around the vertical axis. "
+                    "Toggle this if the model faces the opposite way in "
+                    "Blender and on the phone",
+        default=True)
+    position_scale: FloatProperty(
+        name="Movement scale",
+        description="Multiplier for how far the Blender camera moves. Lower "
+                    "it if the camera moves further than on the phone",
+        default=1.0, min=0.001, soft_max=20.0, precision=3)
 
 
 class _DefaultSettings:
-    """Used if the scene property is not available for some reason."""
+    """Used if the scene properties are not available for some reason."""
     apply_modifiers = False
-    export_normals = True
-    export_uv = True
-    triangulate = True
-    selected_only = False
     max_triangles = 150000
     limit_action = 'DECIMATE'
     max_size_mb = 40
+    export_scale = 1.0
+
+
+class _DefaultCamera:
+    position_mode = 'POSE'
+    flip_direction = True
+    position_scale = 1.0
 
 
 def get_settings():
@@ -176,12 +197,85 @@ def get_settings():
         return _DefaultSettings
 
 
+def get_camera_settings():
+    try:
+        return bpy.context.scene.sr_camera
+    except Exception:
+        return _DefaultCamera
+
+
+'''
+    Phone pose -> Blender camera matrix
+
+    The phone sends 4x4 matrices as column-major arrays, so numpy sees them
+    transposed (the translation is in the last ROW). They are decoded here
+    and expressed in the space of the model (the anchor).
+'''
+
+# Phone/OBJ world (Y up) -> Blender world (Z up): the inverse of the OBJ
+# export (forward -Z, up Y).
+W_OBJ = np.array([[1.0, 0.0, 0.0],
+                  [0.0, 0.0, -1.0],
+                  [0.0, 1.0, 0.0]])
+
+# 180 degrees around the vertical axis of Blender.
+YAW_180 = np.diag([-1.0, -1.0, 1.0])
+
+
+def decode_camera(view, kind):
+    """
+    Camera orientation (3x3, camera->world) and position in the phone world.
+    kind 'VIEW': the matrix is world->camera,  'POSE': it is camera->world.
+    """
+    n = np.asarray(view, dtype=float)
+    if kind == 'POSE':
+        return n[:3, :3].T, n[3, :3].copy()
+    rot = n[:3, :3]
+    return rot, -(rot @ n[3, :3])
+
+
+def decode_anchor(root):
+    """Model (anchor) rotation, position and uniform scale in the phone world."""
+    a = np.asarray(root, dtype=float).T
+    scale = float(np.linalg.norm(a[:3, 0]))
+    if scale < 1e-9 or not np.all(np.isfinite(a)):       # no anchor yet
+        return np.eye(3), np.zeros(3), 1.0
+    return a[:3, :3] / scale, a[:3, 3].copy(), scale
+
+
+def camera_pose(view, root):
+    """Blender camera matrix for a phone frame."""
+    cfg = get_camera_settings()
+    kind = 'POSE' if cfg.position_mode == 'POSE' else 'VIEW'
+
+    rot, cam = decode_camera(view, kind)
+    ra, anchor, scale = decode_anchor(root)
+
+    # express the camera in the model's (anchor's) space
+    rot = ra.T @ rot
+    cam = ra.T @ (cam - anchor) / scale
+    if cfg.position_mode == 'OFF':
+        cam = np.zeros(3)
+    cam = cam * cfg.position_scale
+
+    world = (YAW_180 if cfg.flip_direction else np.eye(3)) @ W_OBJ
+    rot = world @ rot
+    cam = world @ cam
+
+    m = Matrix.Identity(4)
+    for i in range(3):
+        for j in range(3):
+            m[i][j] = float(rot[i, j])
+        m[i][3] = float(cam[i])
+    return m
+
+
 '''
     Scene analysis
 '''
 
 
-def count_triangles(use_modifiers, selected_only):
+def count_triangles(use_modifiers, selected_only=False):
     """
     Count the triangles of visible mesh objects.
     Returns (total, [(object, triangles), ...]). Must run in the main thread.
@@ -202,48 +296,6 @@ def count_triangles(use_modifiers, selected_only):
         total += tris
 
     return total, per_object
-
-
-class SRAnalyzeOperator(bpy.types.Operator):
-    """Hitung jumlah triangle scene dengan pengaturan ekspor saat ini"""
-    bl_idname = "remote.analyze_scene"
-    bl_label = "Analisis scene"
-
-    def execute(self, context):
-        cfg = get_settings()
-        tris, per_object = count_triangles(cfg.apply_modifiers,
-                                           cfg.selected_only)
-        update(an_time=time.time(), an_objects=len(per_object),
-               an_tris=tris, an_modifiers=cfg.apply_modifiers)
-        self.report({'INFO'}, "{:,} triangle di {} objek".format(
-            tris, len(per_object)))
-        return {'FINISHED'}
-
-
-PRESETS = {
-    'LIGHT': dict(apply_modifiers=False, max_triangles=100000,
-                  limit_action='DECIMATE', max_size_mb=20),
-    'MEDIUM': dict(apply_modifiers=False, max_triangles=300000,
-                   limit_action='DECIMATE', max_size_mb=50),
-    'FULL': dict(apply_modifiers=True, max_triangles=0,
-                 limit_action='DECIMATE', max_size_mb=0),
-}
-
-
-class SRPresetOperator(bpy.types.Operator):
-    """Terapkan preset kualitas ekspor"""
-    bl_idname = "remote.apply_export_preset"
-    bl_label = "Preset ekspor"
-
-    preset: EnumProperty(items=[('LIGHT', "Ringan", ""),
-                                ('MEDIUM', "Sedang", ""),
-                                ('FULL', "Penuh", "")])
-
-    def execute(self, context):
-        cfg = context.scene.sr_export
-        for key, value in PRESETS[self.preset].items():
-            setattr(cfg, key, value)
-        return {'FINISHED'}
 
 
 '''
@@ -273,7 +325,7 @@ def _progress(layout, factor, text):
 
 
 class SR_PT_status(bpy.types.Panel):
-    bl_label = "Status & Ekspor"
+    bl_label = "Status & Settings"
     bl_idname = "REMOTE_PT_sr_status"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -284,37 +336,38 @@ class SR_PT_status(bpy.types.Panel):
         now = time.time()
         self._draw_connection(self.layout, s, now)
         self._draw_scene(self.layout, s, now)
-        self._draw_options(self.layout, context, s)
+        self._draw_camera(self.layout)
+        self._draw_export(self.layout)
 
     # -- connection --------------------------------------------------------
     def _draw_connection(self, layout, s, now):
         box = layout.box()
         col = box.column(align=True)
-        col.label(text="Koneksi", icon='LINKED')
+        col.label(text="Connection", icon='LINKED')
 
         if s["server"] != "RUNNING":
-            col.label(text="Server berhenti (tekan START)", icon='PAUSE')
+            col.label(text="Server stopped (press START)", icon='PAUSE')
             return
 
-        col.label(text="Server berjalan", icon='PLAY')
+        col.label(text="Server running", icon='PLAY')
         if not s["last_ping"]:
-            col.label(text="Menunggu HP terhubung...", icon='TIME')
+            col.label(text="Waiting for the phone...", icon='TIME')
         else:
             age = now - s["last_ping"]
             if age > CONNECTION_TIMEOUT:
                 row = col.row()
                 row.alert = True
-                row.label(text="HP tidak merespons ({:.0f}s)".format(age),
+                row.label(text="Phone not responding ({:.0f}s)".format(age),
                           icon='ERROR')
             else:
-                col.label(text="HP terhubung {}".format(
+                col.label(text="Phone connected {}".format(
                     s["client_addr"] or ""), icon='CHECKMARK')
 
         if s["last_frame"] and now - s["last_frame"] < 3:
-            col.label(text="Frame kamera: {:.0f}/detik".format(s["fps"]),
+            col.label(text="Camera frames: {:.0f}/s".format(s["fps"]),
                       icon='CAMERA_DATA')
         else:
-            col.label(text="Frame kamera: tidak ada", icon='CAMERA_DATA')
+            col.label(text="Camera frames: none", icon='CAMERA_DATA')
 
     # -- scene / model -----------------------------------------------------
     def _draw_scene(self, layout, s, now):
@@ -324,98 +377,75 @@ class SR_PT_status(bpy.types.Panel):
 
         phase = s["phase"]
         if phase == "IDLE":
-            col.label(text="Belum ada permintaan dari HP", icon='INFO')
+            col.label(text="No scene request from the phone yet", icon='INFO')
         elif phase == "EXPORTING":
-            _wrap(col, s["message"] or "Mengekspor scene...", 'EXPORT')
-            col.label(text="Sudah {:.0f} detik".format(
+            _wrap(col, s["message"] or "Exporting the scene...", 'EXPORT')
+            col.label(text="Running for {:.0f} s".format(
                 now - s["phase_started"]), icon='TIME')
         elif phase == "READY":
-            col.label(text="Siap dikirim ({})".format(
+            col.label(text="Ready to send ({})".format(
                 _fmt_bytes(s["size_bytes"])), icon='CHECKMARK')
         elif phase == "SENDING":
             total = max(s["total_bytes"], 1)
             sent = min(s["sent_bytes"], total)
             elapsed = max(now - s["send_started"], 0.001)
-            speed = sent / elapsed
-            col.label(text="Mengirim ke HP...", icon='EXPORT')
+            col.label(text="Sending to the phone...", icon='EXPORT')
             _progress(col, sent / total, "{} / {}".format(
                 _fmt_bytes(sent), _fmt_bytes(total)))
-            col.label(text="{}/detik".format(_fmt_bytes(speed)))
+            col.label(text="{}/s".format(_fmt_bytes(sent / elapsed)))
         elif phase == "DONE":
-            col.label(text="Selesai dikirim ({:.1f}s)".format(
-                s["send_seconds"]), icon='CHECKMARK')
-            col.label(text="Jika model belum muncul, HP yang memprosesnya",
+            col.label(text="Sent in {:.1f} s".format(s["send_seconds"]),
+                      icon='CHECKMARK')
+            col.label(text="Model not visible? The phone failed to load it",
                       icon='INFO')
         elif phase == "ERROR":
             _wrap(col, s["message"], 'ERROR', alert=True)
 
         if s["tris_before"]:
             col.separator()
-            col.label(text="Objek: {}".format(s["objects"]))
+            col.label(text="Objects: {}".format(s["objects"]))
             if s["decimated"]:
-                col.label(text="Triangle: {:,} -> {:,} (dikecilkan)".format(
+                col.label(text="Triangles: {:,} -> {:,} (reduced)".format(
                     s["tris_before"], s["tris_after"]), icon='MOD_DECIM')
             else:
-                col.label(text="Triangle: {:,}".format(s["tris_before"]))
+                col.label(text="Triangles: {:,}".format(s["tris_before"]))
         if s["size_bytes"]:
             mb = s["size_bytes"] / (1024 * 1024)
             if mb >= HEAVY_MB:
                 row = col.row()
                 row.alert = True
-                row.label(text="Ukuran {:.0f} MB: BERAT, HP bisa hang".format(
-                    mb), icon='ERROR')
+                row.label(text="Size {:.0f} MB: HEAVY, phone may freeze"
+                          .format(mb), icon='ERROR')
             elif mb >= MEDIUM_MB:
-                col.label(text="Ukuran {:.0f} MB: sedang".format(mb),
+                col.label(text="Size {:.0f} MB: medium".format(mb),
                           icon='INFO')
             else:
-                col.label(text="Ukuran {:.1f} MB: ringan".format(mb),
+                col.label(text="Size {:.1f} MB: light".format(mb),
                           icon='CHECKMARK')
-            col.label(text="Waktu ekspor: {:.1f}s".format(
+            col.label(text="Export time: {:.1f} s".format(
                 s["export_seconds"]))
 
-    # -- options -----------------------------------------------------------
-    def _draw_options(self, layout, context, s):
+    # -- camera ------------------------------------------------------------
+    def _draw_camera(self, layout):
+        cfg = get_camera_settings()
+        box = layout.box()
+        col = box.column(align=True)
+        col.label(text="Camera", icon='CAMERA_DATA')
+        col.prop(cfg, "position_mode", text="")
+        col.prop(cfg, "flip_direction")
+        col.prop(cfg, "position_scale")
+
+    # -- export ------------------------------------------------------------
+    def _draw_export(self, layout):
         cfg = get_settings()
         box = layout.box()
         col = box.column(align=True)
-        col.label(text="Opsi ekspor ke HP", icon='PREFERENCES')
-
-        row = col.row(align=True)
-        for key, text in (('LIGHT', "Ringan"), ('MEDIUM', "Sedang"),
-                          ('FULL', "Penuh")):
-            op = row.operator("remote.apply_export_preset", text=text)
-            op.preset = key
-
-        col.separator()
+        col.label(text="Export to the phone", icon='EXPORT')
         col.prop(cfg, "max_triangles")
         col.prop(cfg, "limit_action", text="")
         col.prop(cfg, "max_size_mb")
-        col.separator()
+        col.prop(cfg, "export_scale")
         col.prop(cfg, "apply_modifiers")
-        col.prop(cfg, "selected_only")
-        row = col.row(align=True)
-        row.prop(cfg, "export_normals", toggle=True)
-        row.prop(cfg, "export_uv", toggle=True)
-        row.prop(cfg, "triangulate", toggle=True)
-
-        col.separator()
-        col.operator("remote.analyze_scene", icon='VIEWZOOM')
-        if s["an_time"]:
-            col.label(text="Hasil: {:,} triangle, {} objek".format(
-                s["an_tris"], s["an_objects"]))
-            limit = cfg.max_triangles
-            if not limit:
-                col.label(text="Tanpa batas: model besar bisa membuat HP hang",
-                          icon='INFO')
-            elif s["an_tris"] <= limit:
-                col.label(text="Di bawah batas: aman dikirim",
-                          icon='CHECKMARK')
-            elif cfg.limit_action == 'DECIMATE':
-                _wrap(col, "Melebihi batas: akan dikecilkan otomatis ke "
-                           "sekitar {:,} triangle".format(limit), 'MOD_DECIM')
-            else:
-                _wrap(col, "Melebihi batas: scene TIDAK akan dikirim",
-                      'ERROR', alert=True)
 
 
 '''
@@ -467,8 +497,7 @@ def _ui_refresh():
 
 classes = (
     SRExportSettings,
-    SRAnalyzeOperator,
-    SRPresetOperator,
+    SRCameraSettings,
     SR_PT_status,
 )
 
@@ -479,6 +508,7 @@ def register():
     for cls in classes:
         register_class(cls)
     bpy.types.Scene.sr_export = PointerProperty(type=SRExportSettings)
+    bpy.types.Scene.sr_camera = PointerProperty(type=SRCameraSettings)
 
     if not bpy.app.timers.is_registered(_ui_refresh):
         bpy.app.timers.register(_ui_refresh, first_interval=0.5,
@@ -491,10 +521,11 @@ def unregister():
     if bpy.app.timers.is_registered(_ui_refresh):
         bpy.app.timers.unregister(_ui_refresh)
 
-    try:
-        del bpy.types.Scene.sr_export
-    except Exception:
-        pass
+    for name in ("sr_export", "sr_camera"):
+        try:
+            delattr(bpy.types.Scene, name)
+        except Exception:
+            pass
 
     for cls in reversed(classes):
         unregister_class(cls)
