@@ -19,6 +19,7 @@ import zmq
 import msgpack
 import numpy as np
 
+import queue
 import threading
 import logging
 import time
@@ -27,7 +28,7 @@ from . import environment
 
 TIMEOUT = 1
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 class Camera():
@@ -50,7 +51,7 @@ class Node():
     """Sceneform Node
 
     """
-    
+
     def __init__(self, wm = None):
         if wm:
             self.world_matrix =  np.matrix([[wm[0],wm[1],wm[2],wm[3]],
@@ -78,7 +79,7 @@ class Frame():
         while len(frame_buffer)>0:
             header =  frame_buffer.pop(0)
             if header == b"STATE":
-                frame.mode = frame_buffer.pop(0).decode()    
+                frame.mode = frame_buffer.pop(0).decode()
 
             elif header == b"CAMERA":
                 arCamera = Camera(
@@ -99,13 +100,21 @@ class Frame():
 class ArEventHandler():
     """ Application Event handler
 
-    Used to link Android Application event with 
-    the local application(ex: blender).  
+    Used to link Android Application event with
+    the local application(ex: blender).
     """
     def __init__(self):
         self._frameListeners = []
         self._getScene = None
         self._record = None
+        self._ping = None
+
+    def bindPing(self, f):
+        self._ping = f
+
+    def OnPing(self, client_addr):
+        if self._ping:
+            self._ping(client_addr)
 
     def bindOnFrameReceived(self,f):
         self._frameListeners.append(f)
@@ -137,7 +146,7 @@ class ArEventHandler():
 class ArCoreInterface(object):
     """ Application Ar interface
 
-    Interface in charge to manage the network bridge 
+    Interface in charge to manage the network bridge
     between local application and the remote app.
     """
     def __init__(self, handler, port=63150):
@@ -159,46 +168,99 @@ class AppLink(threading.Thread):
 
     Thread use to listen android remote application.
 
-    TODO: complete this area
-
+    The network loop (frames, heartbeat, record) never blocks on a scene
+    export: SCENE requests are handled by a worker thread and the answers
+    are sent back by the loop itself (zmq sockets are not thread safe).
     """
     def __init__(
             self,
             handler,
             port=63150,
-            context=zmq.Context.instance(),
+            context=None,
             name="Applink"):
 
         threading.Thread.__init__(self)
         self.name = name
+        self.daemon = True  # never keep Blender alive after quit
         self.status = 0  # 0: idle, 1: Connecting, 2: Connected
-        self.context = context
-        
-        # The command socket handle asynchonous commands
-        # the from android application
-        self.command_socket = self.context.socket(zmq.ROUTER)
-        self.command_socket.setsockopt(zmq.IDENTITY, b'SERVER')
-        self.command_socket.setsockopt(zmq.RCVHWM, 0)   
-        self.command_socket.bind("tcp://*:{}".format(port+2))
+        self.context = context or zmq.Context.instance()
 
-        # Data socket is used load each frame ARCore state from 
-        # the android application 
-        self.data_socket = self.context.socket(zmq.PULL)
-        self.data_socket.bind("tcp://*:{}".format(port+1))
-        self.data_socket.linger = 0
-        
-        # TTL socket is in charge of the connexion monitoring 
-        self.ttl_socket = self.context.socket(zmq.ROUTER)
-        self.ttl_socket.setsockopt(zmq.IDENTITY, b'SERVERTTL')
-        self.ttl_socket.setsockopt(zmq.RCVHWM, 0)   
-        self.ttl_socket.linger = 0
-        self.ttl_socket.bind("tcp://*:{}".format(port))
+        self.command_socket = None
+        self.data_socket = None
+        self.ttl_socket = None
+
+        try:
+            # The command socket handle asynchonous commands
+            # the from android application
+            self.command_socket = self.context.socket(zmq.ROUTER)
+            self.command_socket.setsockopt(zmq.IDENTITY, b'SERVER')
+            self.command_socket.setsockopt(zmq.RCVHWM, 0)
+            self.command_socket.linger = 0
+            self.command_socket.bind("tcp://*:{}".format(port+2))
+
+            # Data socket is used load each frame ARCore state from
+            # the android application
+            self.data_socket = self.context.socket(zmq.PULL)
+            self.data_socket.linger = 0
+            self.data_socket.bind("tcp://*:{}".format(port+1))
+
+            # TTL socket is in charge of the connexion monitoring
+            self.ttl_socket = self.context.socket(zmq.ROUTER)
+            self.ttl_socket.setsockopt(zmq.IDENTITY, b'SERVERTTL')
+            self.ttl_socket.setsockopt(zmq.RCVHWM, 0)
+            self.ttl_socket.linger = 0
+            self.ttl_socket.bind("tcp://*:{}".format(port))
+        except Exception:
+            # Do not leak half-bound ports: otherwise every following
+            # Start fails with "Address already in use" until Blender restarts.
+            self._close_sockets()
+            raise
 
         self.client_addr = None
 
         self.exit_event = threading.Event()
         self.handler = handler
 
+        self._scene_requests = queue.Queue()
+        self._outbox = queue.Queue()
+
+    def _close_sockets(self):
+        for name in ("data_socket", "ttl_socket", "command_socket"):
+            sock = getattr(self, name, None)
+            if sock is not None:
+                try:
+                    sock.close(linger=0)
+                except Exception:
+                    pass
+                setattr(self, name, None)
+
+    def _scene_worker(self):
+        """Compute scene chunks away from the network loop."""
+        while not self.exit_event.is_set():
+            try:
+                identity, offset, chunk_size = self._scene_requests.get(
+                    timeout=0.2)
+            except queue.Empty:
+                continue
+
+            try:
+                chunk = self.handler.OnGetScene(offset, chunk_size) or b""
+            except Exception:
+                log.exception("GetScene failed")
+                chunk = b""
+
+            # Always answer: a missing answer leaves the phone waiting
+            # forever ("nothing happens").
+            self._outbox.put((identity, [b"SCENE", chunk]))
+
+    def _flush_outbox(self):
+        while True:
+            try:
+                identity, payload = self._outbox.get_nowait()
+            except queue.Empty:
+                return
+            self.command_socket.send(identity, zmq.SNDMORE)
+            self.command_socket.send_multipart(payload)
 
     def run(self):
         log.debug("Running App link")
@@ -208,62 +270,77 @@ class AppLink(threading.Thread):
         poller.register(self.ttl_socket, zmq.POLLIN)
         poller.register(self.command_socket, zmq.POLLIN)
 
-        while not self.exit_event.is_set():
-            items = dict(poller.poll(TIMEOUT))
+        worker = threading.Thread(
+            target=self._scene_worker, name="ApplinkScene", daemon=True)
+        worker.start()
 
-            # Handle arcord data replication
-            if self.data_socket in items:
+        try:
+            while not self.exit_event.is_set():
                 try:
-                    self.handler.OnFrameReceived(Frame.recv(self.data_socket))              
-                except:
-                    log.info("error")
-            # Handle live link heartbeat
-            if self.ttl_socket in items:
-                request = self.ttl_socket.recv_multipart()
-                identity = request[0]
+                    items = dict(poller.poll(TIMEOUT))
 
-                if self.client_addr is None:
-                    self.client_addr = request[2].decode()
-                
-                self.ttl_socket.send(identity, zmq.SNDMORE)
-                self.ttl_socket.send_multipart([b"pong"])
-            
-            # Handle remote command
-            if self.command_socket in items:
-                command = self.command_socket.recv_multipart()
-                identity = command[0]
+                    # Handle arcore data replication
+                    if self.data_socket in items:
+                        try:
+                            self.handler.OnFrameReceived(
+                                Frame.recv(self.data_socket))
+                        except Exception as e:
+                            log.warning("bad frame: {}".format(e))
 
-                if command[1] == b"SCENE":
-                    log.debug("Try to get scene")
-                    scene_data_chunk = self.handler.OnGetScene(int(command[2]),int(command[3]))
-                   
-                    if scene_data_chunk:                        
-                        self.command_socket.send(identity, zmq.SNDMORE)
-                        self.command_socket.send_multipart([b"SCENE",scene_data_chunk])
-                       
-                    else:
-                        log.info("GetScene not implemented")
+                    # Handle live link heartbeat
+                    if self.ttl_socket in items:
+                        request = self.ttl_socket.recv_multipart()
+                        identity = request[0]
 
-                elif command[1] == b"RECORD":
-                    result = self.handler.OnRecord(command[2].decode())
-                    response = [b"RECORD"]
-                    if result:
-                        response.append(result.encode())
-                    else:
-                        response.append(b"STOPPED")
+                        if self.client_addr is None and len(request) > 2:
+                            self.client_addr = request[2].decode()
 
-                    self.command_socket.send(identity, zmq.SNDMORE)
-                    self.command_socket.send_multipart(response)
-                else:
-                    log.error("Wrong request")
+                        try:
+                            self.handler.OnPing(self.client_addr)
+                        except Exception as e:
+                            log.warning("ping hook failed: {}".format(e))
 
+                        self.ttl_socket.send(identity, zmq.SNDMORE)
+                        self.ttl_socket.send_multipart([b"pong"])
 
+                    # Handle remote command
+                    if self.command_socket in items:
+                        command = self.command_socket.recv_multipart()
+                        identity = command[0]
 
-        log.debug("Exiting App link")
+                        if command[1] == b"SCENE":
+                            log.debug("Scene requested: offset={} size={}"
+                                      .format(int(command[2]),
+                                              int(command[3])))
+                            self._scene_requests.put(
+                                (identity, int(command[2]), int(command[3])))
 
-        self.data_socket.close()
-        self.ttl_socket.close()
-        self.command_socket.close()
+                        elif command[1] == b"RECORD":
+                            result = self.handler.OnRecord(
+                                command[2].decode())
+                            response = [b"RECORD"]
+                            if result:
+                                response.append(result.encode())
+                            else:
+                                response.append(b"STOPPED")
+
+                            self.command_socket.send(identity, zmq.SNDMORE)
+                            self.command_socket.send_multipart(response)
+                        else:
+                            log.error("Wrong request")
+
+                    self._flush_outbox()
+
+                except zmq.ZMQError as e:
+                    if self.exit_event.is_set():
+                        break
+                    log.error("zmq error: {}".format(e))
+                except Exception:
+                    # One bad message must never kill the link thread
+                    log.exception("App link loop error")
+        finally:
+            log.debug("Exiting App link")
+            self._close_sockets()
 
     def stop(self):
         self.exit_event.set()
@@ -275,7 +352,7 @@ if __name__ == "__main__":
     ar_handler = ArEventHandler()
 
     def test(frame):
-        log.debug(frame.camera.translation)
+        log.debug(frame.camera.view_matrix)
 
     ar_handler.bindOnFrameReceived(test)
 
@@ -286,4 +363,3 @@ if __name__ == "__main__":
 
 
     ar.stop()
-
