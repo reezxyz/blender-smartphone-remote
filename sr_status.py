@@ -57,6 +57,9 @@ _state = dict(
     frames=0,
     last_frame=0.0,
     fps=0.0,
+    jumps_rejected=0,
+    jumps_accepted=0,
+    last_jump="",
 
     phase="IDLE",            # IDLE | EXPORTING | READY | SENDING | DONE | ERROR
     phase_started=0.0,
@@ -112,6 +115,7 @@ def note_ping(client_addr=None):
 def set_server_running(running):
     update(server="RUNNING" if running else "STOPPED",
            client_addr=None, last_ping=0.0, last_frame=0.0, fps=0.0,
+           jumps_rejected=0, jumps_accepted=0, last_jump="",
            phase="IDLE", message="")
 
 
@@ -189,6 +193,12 @@ class SRCameraSettings(bpy.types.PropertyGroup):
                     "Toggle this if the model faces the opposite way in "
                     "Blender and on the phone",
         default=True)
+    reject_jumps: BoolProperty(
+        name="Ignore tracking glitches",
+        description="Drop sudden impossible jumps of the phone pose (the "
+                    "camera 'teleporting'). A jump that stays is accepted "
+                    "after a few frames",
+        default=True)
     record_max_frames: IntProperty(
         name="Max recorded frames",
         description="Maximum length of a camera recording. The scene end "
@@ -218,6 +228,7 @@ class _DefaultCamera:
     flip_direction = True
     position_scale = 1.0
     record_max_frames = 3000
+    reject_jumps = True
 
 
 def get_settings():
@@ -271,6 +282,88 @@ def decode_anchor(root):
     if scale < 1e-9 or not np.all(np.isfinite(a)):       # no anchor yet
         return np.eye(3), np.zeros(3), 1.0
     return a[:3, :3] / scale, a[:3, 3].copy(), scale
+
+
+def physical_pose(view, root):
+    """Camera rotation and position (metres) relative to the anchor."""
+    cfg = get_camera_settings()
+    kind = 'POSE' if cfg.position_mode == 'POSE' else 'VIEW'
+    rot, cam = decode_camera(view, kind)
+    ra, anchor, _scale = decode_anchor(root)
+    return ra.T @ rot, ra.T @ (cam - anchor)
+
+
+class JumpFilter:
+    """
+    Rejects impossible pose jumps (a hand cannot move 0.5 m or turn 60 degrees
+    between two frames). A new pose that keeps being reported, frame after
+    frame, is a real relocalisation of ARCore and is accepted.
+    """
+    POS_BASE = 0.20       # metres allowed even in a single instant
+    POS_SPEED = 8.0       # metres per second
+    ROT_BASE = 20.0       # degrees
+    ROT_SPEED = 900.0     # degrees per second
+    CONFIRM = 6           # frames in a row before a jump is believed
+    CLOSE_POS = 0.15
+    CLOSE_ROT = 12.0
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.last = None          # (rot, pos) of the last accepted frame
+        self.prev_time = None
+        self.cand = None          # (rot, pos, count)
+
+    @staticmethod
+    def _angle(ra, rb):
+        c = (np.trace(ra.T @ rb) - 1.0) / 2.0
+        return float(np.degrees(np.arccos(min(1.0, max(-1.0, c)))))
+
+    def accept(self, rot, pos, now):
+        """-> (use_this_frame, event, distance_m, angle_deg); event is None,
+        'reject' or 'jump' (a jump that was finally accepted)."""
+        dt = 0.0 if self.prev_time is None else min(max(now - self.prev_time, 0.0), 1.0)
+        self.prev_time = now
+
+        if self.last is None or not (np.all(np.isfinite(rot)) and np.all(np.isfinite(pos))):
+            if np.all(np.isfinite(rot)) and np.all(np.isfinite(pos)):
+                self.last = (rot, pos)
+                return True, None, 0.0, 0.0
+            return False, 'reject', 0.0, 0.0
+
+        dist = float(np.linalg.norm(pos - self.last[1]))
+        ang = self._angle(self.last[0], rot)
+        if (dist <= self.POS_BASE + self.POS_SPEED * dt
+                and ang <= self.ROT_BASE + self.ROT_SPEED * dt):
+            self.last = (rot, pos)
+            self.cand = None
+            return True, None, dist, ang
+
+        # suspicious frame
+        count = 1
+        if self.cand is not None:
+            near = (float(np.linalg.norm(pos - self.cand[1])) <= self.CLOSE_POS
+                    and self._angle(self.cand[0], rot) <= self.CLOSE_ROT)
+            if near:
+                count = self.cand[2] + 1
+        self.cand = (rot, pos, count)
+        if count >= self.CONFIRM:
+            self.last = (rot, pos)
+            self.cand = None
+            return True, 'jump', dist, ang
+        return False, 'reject', dist, ang
+
+
+def note_jump(event, dist, ang):
+    """Record a filtered glitch / an accepted jump for the panel."""
+    with _lock:
+        if event == 'reject':
+            _state["jumps_rejected"] += 1
+        elif event == 'jump':
+            _state["jumps_accepted"] += 1
+        _state["last_jump"] = "{:.2f} m, {:.0f} deg".format(dist, ang)
+    update()
 
 
 def camera_pose(view, root):
@@ -434,6 +527,11 @@ class SR_PT_status(bpy.types.Panel):
         if s["last_frame"] and now - s["last_frame"] < 3:
             col.label(text="Camera frames: {:.0f}/s".format(s["fps"]),
                       icon='CAMERA_DATA')
+            if s["jumps_rejected"] or s["jumps_accepted"]:
+                col.label(text="Glitches ignored: {}  (real jumps: {})".format(
+                    s["jumps_rejected"], s["jumps_accepted"]), icon='INFO')
+                if s["last_jump"]:
+                    col.label(text="Last jump: " + s["last_jump"])
         else:
             row = col.row()
             row.alert = bool(s["last_ping"]
@@ -518,6 +616,7 @@ class SR_PT_status(bpy.types.Panel):
         col.prop(cfg, "position_mode", text="")
         col.prop(cfg, "flip_direction")
         col.prop(cfg, "position_scale")
+        col.prop(cfg, "reject_jumps")
         col.prop(cfg, "record_max_frames")
 
         col.separator()

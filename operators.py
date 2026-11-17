@@ -52,6 +52,7 @@ BLENDER = np.matrix([[-1, 0, 0, 0],
 app = None
 is_recording = False
 _saved_frame_end = None
+_jump_filter = sr_status.JumpFilter()
 
 # Each job carries its OWN reply queue, so results can never be mixed up
 # between threads.
@@ -276,6 +277,15 @@ def apply_camera_pose(frame):
     try:
         camera = bpy.context.scene.camera
         if camera:
+            if getattr(sr_status.get_camera_settings(), "reject_jumps", True):
+                rot, pos = sr_status.physical_pose(
+                    frame.camera.view_matrix, frame.root.world_matrix)
+                use, event, dist, ang = _jump_filter.accept(
+                    rot, pos, time.time())
+                if event:
+                    sr_status.note_jump(event, dist, ang)
+                if not use:
+                    return
             camera.matrix_world = _compute_pose(frame)
 
             fov = frame.camera.intrinsics[0]
