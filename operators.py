@@ -51,6 +51,7 @@ BLENDER = np.matrix([[-1, 0, 0, 0],
 
 app = None
 is_recording = False
+_saved_frame_end = None
 
 # Each job carries its OWN reply queue, so results can never be mixed up
 # between threads.
@@ -301,6 +302,14 @@ def setup_camera_animation():
     scene.camera.animation_data_create()
     scene.camera.animation_data.action = new_action
 
+    # Allow recordings longer than the scene range (default end = 250)
+    global _saved_frame_end
+    if _saved_frame_end is None:
+        _saved_frame_end = scene.frame_end
+    limit = int(sr_status.get_camera_settings().record_max_frames)
+    scene.frame_end = max(scene.frame_start + limit, _saved_frame_end)
+    scene.frame_current = scene.frame_start
+
     # Launch record
     override = get_window_override()
     with bpy.context.temp_override(**override):
@@ -318,7 +327,12 @@ def stop_camera_animation():
         screen = bpy.context.screen
         if screen is not None and screen.is_animation_playing:
             bpy.ops.screen.animation_cancel()
-    bpy.context.scene.frame_current = 1
+    scene = bpy.context.scene
+    global _saved_frame_end
+    if _saved_frame_end is not None:
+        scene.frame_end = _saved_frame_end
+        _saved_frame_end = None
+    scene.frame_current = scene.frame_start
     is_recording = False
 
 

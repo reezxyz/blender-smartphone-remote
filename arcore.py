@@ -163,6 +163,15 @@ class ArCoreInterface(object):
         self._net_link.stop()
 
 
+def _handover(sock):
+    """A phone that reconnects with the same identity replaces the old
+    (dead) connection instead of being ignored. Fixes the 2nd recording."""
+    try:
+        sock.setsockopt(zmq.ROUTER_HANDOVER, 1)
+    except Exception:
+        pass
+
+
 class AppLink(threading.Thread):
     """ Application network link
 
@@ -195,6 +204,7 @@ class AppLink(threading.Thread):
             self.command_socket = self.context.socket(zmq.ROUTER)
             self.command_socket.setsockopt(zmq.IDENTITY, b'SERVER')
             self.command_socket.setsockopt(zmq.RCVHWM, 0)
+            _handover(self.command_socket)
             self.command_socket.linger = 0
             self.command_socket.bind("tcp://*:{}".format(port+2))
 
@@ -208,6 +218,7 @@ class AppLink(threading.Thread):
             self.ttl_socket = self.context.socket(zmq.ROUTER)
             self.ttl_socket.setsockopt(zmq.IDENTITY, b'SERVERTTL')
             self.ttl_socket.setsockopt(zmq.RCVHWM, 0)
+            _handover(self.ttl_socket)
             self.ttl_socket.linger = 0
             self.ttl_socket.bind("tcp://*:{}".format(port))
         except Exception:

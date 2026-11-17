@@ -189,6 +189,11 @@ class SRCameraSettings(bpy.types.PropertyGroup):
                     "Toggle this if the model faces the opposite way in "
                     "Blender and on the phone",
         default=True)
+    record_max_frames: IntProperty(
+        name="Max recorded frames",
+        description="Maximum length of a camera recording. The scene end "
+                    "frame is raised for the recording and restored after",
+        default=3000, min=10, soft_max=20000)
     position_scale: FloatProperty(
         name="Movement scale",
         description="Multiplier for how far the Blender camera moves. Lower "
@@ -212,6 +217,7 @@ class _DefaultCamera:
     position_mode = 'POSE'
     flip_direction = True
     position_scale = 1.0
+    record_max_frames = 3000
 
 
 def get_settings():
@@ -512,6 +518,7 @@ class SR_PT_status(bpy.types.Panel):
         col.prop(cfg, "position_mode", text="")
         col.prop(cfg, "flip_direction")
         col.prop(cfg, "position_scale")
+        col.prop(cfg, "record_max_frames")
 
         col.separator()
         col.label(text="Camera resolution")
