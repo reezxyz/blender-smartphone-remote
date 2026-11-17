@@ -69,7 +69,11 @@ _frame_lock = threading.Lock()
 _pending_frame = None
 
 
-class SceneTooLarge(Exception):
+class SceneRefused(Exception):
+    """Raised when the scene must not be sent (message shown in the panel)."""
+
+
+class SceneTooLarge(SceneRefused):
     """Raised when the scene exceeds the configured limits."""
 
 
@@ -159,7 +163,7 @@ def _executor_tick():
             result = function(args) if args is not None else function()
             reply.put((True, result))
         except Exception as e:
-            if not isinstance(e, SceneTooLarge):
+            if not isinstance(e, SceneRefused):
                 log.exception("main thread job failed")
             reply.put((False, e))
 
@@ -352,6 +356,46 @@ def record_camera(status):
 '''
 
 
+def _hide_unwanted_objects(cfg, hidden):
+    """
+    Temporarily hide (in the viewport) every object that must not be
+    exported, following the "Objects to export" setting. The hidden objects
+    are appended to `hidden` so the caller can always restore them.
+    """
+    mode = cfg.export_mode
+    if mode == 'VISIBLE':
+        return
+
+    visible = [o for o in bpy.context.view_layer.objects if o.visible_get()]
+
+    if mode == 'SELECTED':
+        keep = {o.name for o in visible if o.select_get()}
+        hint = "Select the objects you want to send first."
+    elif mode == 'COLLECTION':
+        collection = cfg.export_collection
+        if collection is None:
+            raise SceneRefused("Pick a collection to export first.")
+        names = {o.name for o in collection.all_objects}
+        keep = {o.name for o in visible if o.name in names}
+        hint = "The chosen collection has no visible objects."
+    else:  # 'RENDERABLE'
+        keep = {o.name for o in visible if not o.hide_render}
+        hint = "No visible object is enabled for rendering."
+
+    if not keep:
+        raise SceneRefused("Nothing to export. " + hint)
+
+    for obj in visible:
+        if obj.name in keep:
+            continue
+        try:
+            obj.hide_set(True)
+            hidden.append(obj)
+        except Exception as e:
+            log.warning("cannot hide {}: {}".format(obj.name, e))
+    bpy.context.view_layer.update()
+
+
 def export_cached_scene():
     """
     Export the current scene to SCENE_FILE (runs in the main thread),
@@ -373,19 +417,22 @@ def export_cached_scene():
     limit = cfg.max_triangles
     t0 = time.time()
 
-    # --- 1. how big is the scene? ---------------------------------------
-    tris, per_object = sr_status.count_triangles(cfg.apply_modifiers)
-    tris_before = tris
-    tris_after = tris
     use_modifiers = cfg.apply_modifiers
     decimated = False
     temp_modifiers = []
-    sr_status.update(objects=len(per_object), tris_before=tris,
-                     tris_after=tris, decimated=False)
-    log.info("scene: {} objects, {:,} triangles (limit {:,})".format(
-        len(per_object), tris, limit))
+    hidden = []
 
     try:
+        # --- 1. choose the objects, then see how big the scene is -------
+        _hide_unwanted_objects(cfg, hidden)
+        tris, per_object = sr_status.count_triangles(cfg.apply_modifiers)
+        tris_before = tris
+        tris_after = tris
+        sr_status.update(objects=len(per_object), tris_before=tris,
+                         tris_after=tris, decimated=False)
+        log.info("scene: {} objects, {:,} triangles (limit {:,})".format(
+            len(per_object), tris, limit))
+
         # --- 2. apply the triangle budget -------------------------------
         if limit and tris > limit:
             if cfg.limit_action == 'BLOCK':
@@ -458,7 +505,12 @@ def export_cached_scene():
             except Exception as e:
                 log.warning("cannot remove temp modifier on {}: {}".format(
                     obj.name, e))
-        if temp_modifiers:
+        for obj in hidden:
+            try:
+                obj.hide_set(False)
+            except Exception as e:
+                log.warning("cannot unhide {}: {}".format(obj.name, e))
+        if temp_modifiers or hidden:
             bpy.context.view_layer.update()
 
     if 'FINISHED' not in result or not os.path.exists(tmp_path):
@@ -483,6 +535,16 @@ def export_cached_scene():
     return final_path
 
 
+def _send_model_enabled():
+    """Read the setting in the main thread (bpy is not thread safe)."""
+    try:
+        return bool(run_in_main_thread(
+            lambda: sr_status.get_settings().send_model))
+    except Exception as e:
+        log.warning("cannot read send_model, sending the model: {}".format(e))
+        return True
+
+
 def get_cached_scene(offset, chunk_size):
     """
     Return `chunk_size` bytes of the exported scene starting at `offset`.
@@ -493,6 +555,13 @@ def get_cached_scene(offset, chunk_size):
     status panel.
     """
     global _scene_cache, _scene_cache_time
+
+    if not _send_model_enabled():
+        if offset == 0:
+            log.info("tracking only: the model is not sent")
+            sr_status.update(phase="IDLE", message="", sent_bytes=0,
+                             total_bytes=0, size_bytes=0)
+        return b""
 
     with _scene_lock:
         fresh = (_scene_cache
@@ -521,7 +590,7 @@ def get_cached_scene(offset, chunk_size):
                                  size_bytes=len(_scene_cache),
                                  total_bytes=len(_scene_cache),
                                  export_seconds=time.time() - t0)
-            except SceneTooLarge as e:
+            except SceneRefused as e:
                 log.warning("scene refused: {}".format(e))
                 _scene_cache = b""
                 sr_status.update(phase="ERROR", message=str(e))

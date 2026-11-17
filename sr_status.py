@@ -121,6 +121,11 @@ def set_server_running(running):
 
 
 class SRExportSettings(bpy.types.PropertyGroup):
+    send_model: BoolProperty(
+        name="Send model to the phone",
+        description="Turn off to use the phone only as a motion tracker "
+                    "(gyro / ARCore). No model is exported or sent",
+        default=True)
     apply_modifiers: BoolProperty(
         name="Apply modifiers",
         description="Include modifier results (Subdivision, Bevel, ...). "
@@ -150,6 +155,22 @@ class SRExportSettings(bpy.types.PropertyGroup):
         name="Model scale",
         description="Multiplier for the size of the model sent to the phone",
         default=1.0, min=0.001, soft_max=100.0, precision=3)
+    export_mode: EnumProperty(
+        name="Objects to export",
+        description="Which objects are sent to the phone",
+        items=[('VISIBLE', "Visible in viewport",
+                "Everything that is visible in the 3D viewport"),
+               ('SELECTED', "Selected objects",
+                "Only the objects that are currently selected"),
+               ('COLLECTION', "A collection",
+                "Only the visible objects of one collection"),
+               ('RENDERABLE', "Enabled for rendering",
+                "Visible objects whose render (camera) icon is enabled")],
+        default='VISIBLE')
+    export_collection: PointerProperty(
+        name="Collection",
+        description="Collection to send to the phone",
+        type=bpy.types.Collection)
 
 
 class SRCameraSettings(bpy.types.PropertyGroup):
@@ -176,12 +197,15 @@ class SRCameraSettings(bpy.types.PropertyGroup):
 
 
 class _DefaultSettings:
+    send_model = True
     """Used if the scene properties are not available for some reason."""
     apply_modifiers = False
     max_triangles = 150000
     limit_action = 'DECIMATE'
     max_size_mb = 40
     export_scale = 1.0
+    export_mode = 'VISIBLE'
+    export_collection = None
 
 
 class _DefaultCamera:
@@ -275,7 +299,7 @@ def camera_pose(view, root):
 '''
 
 
-def count_triangles(use_modifiers, selected_only=False):
+def count_triangles(use_modifiers):
     """
     Count the triangles of visible mesh objects.
     Returns (total, [(object, triangles), ...]). Must run in the main thread.
@@ -287,8 +311,6 @@ def count_triangles(use_modifiers, selected_only=False):
     for obj in bpy.context.view_layer.objects:
         if obj.type != 'MESH' or not obj.visible_get():
             continue
-        if selected_only and not obj.select_get():
-            continue
 
         mesh = obj.evaluated_get(depsgraph).data if use_modifiers else obj.data
         tris = len(mesh.loops) - 2 * len(mesh.polygons)
@@ -296,6 +318,46 @@ def count_triangles(use_modifiers, selected_only=False):
         total += tris
 
     return total, per_object
+
+
+RESOLUTION_PRESETS = {
+    'P916': (1080, 1920),
+    'P195': (1080, 2340),
+    'L169': (1920, 1080),
+    'L195': (2340, 1080),
+}
+
+
+class SRResolutionOperator(bpy.types.Operator):
+    """Set the render resolution of the Blender camera"""
+    bl_idname = "remote.set_resolution"
+    bl_label = "Set resolution"
+
+    preset: EnumProperty(items=[('P916', "Portrait 9:16", ""),
+                                ('P195', "Portrait 9:19.5", ""),
+                                ('L169', "Landscape 16:9", ""),
+                                ('L195', "Landscape 19.5:9", "")])
+
+    def execute(self, context):
+        width, height = RESOLUTION_PRESETS[self.preset]
+        render = context.scene.render
+        render.resolution_x = width
+        render.resolution_y = height
+        render.resolution_percentage = 100
+        self.report({'INFO'}, "Resolution set to {} x {}".format(width, height))
+        return {'FINISHED'}
+
+
+class SRSwapResolutionOperator(bpy.types.Operator):
+    """Swap the width and the height (portrait <-> landscape)"""
+    bl_idname = "remote.swap_resolution"
+    bl_label = "Swap portrait / landscape"
+
+    def execute(self, context):
+        render = context.scene.render
+        render.resolution_x, render.resolution_y = (render.resolution_y,
+                                                    render.resolution_x)
+        return {'FINISHED'}
 
 
 '''
@@ -336,7 +398,7 @@ class SR_PT_status(bpy.types.Panel):
         now = time.time()
         self._draw_connection(self.layout, s, now)
         self._draw_scene(self.layout, s, now)
-        self._draw_camera(self.layout)
+        self._draw_camera(self.layout, context)
         self._draw_export(self.layout)
 
     # -- connection --------------------------------------------------------
@@ -367,7 +429,19 @@ class SR_PT_status(bpy.types.Panel):
             col.label(text="Camera frames: {:.0f}/s".format(s["fps"]),
                       icon='CAMERA_DATA')
         else:
-            col.label(text="Camera frames: none", icon='CAMERA_DATA')
+            row = col.row()
+            row.alert = bool(s["last_ping"]
+                             and now - s["last_ping"] <= CONNECTION_TIMEOUT)
+            if s["last_frame"]:
+                row.label(text="Camera frames stopped {:.0f}s ago".format(
+                    now - s["last_frame"]), icon='ERROR')
+            else:
+                row.label(text="Camera frames: none", icon='CAMERA_DATA')
+            if row.alert:
+                _wrap(col, "The phone is connected but sends no camera data. "
+                           "ARCore probably lost tracking: point the phone "
+                           "at a textured surface, or restart the app.",
+                      'INFO')
 
     # -- scene / model -----------------------------------------------------
     def _draw_scene(self, layout, s, now):
@@ -376,6 +450,9 @@ class SR_PT_status(bpy.types.Panel):
         col.label(text="Scene / Model", icon='MESH_DATA')
 
         phase = s["phase"]
+        if not get_settings().send_model:
+            col.label(text="Tracking only: no model is sent", icon='INFO')
+            return
         if phase == "IDLE":
             col.label(text="No scene request from the phone yet", icon='INFO')
         elif phase == "EXPORTING":
@@ -426,8 +503,9 @@ class SR_PT_status(bpy.types.Panel):
                 s["export_seconds"]))
 
     # -- camera ------------------------------------------------------------
-    def _draw_camera(self, layout):
+    def _draw_camera(self, layout, context):
         cfg = get_camera_settings()
+        render = context.scene.render
         box = layout.box()
         col = box.column(align=True)
         col.label(text="Camera", icon='CAMERA_DATA')
@@ -435,12 +513,34 @@ class SR_PT_status(bpy.types.Panel):
         col.prop(cfg, "flip_direction")
         col.prop(cfg, "position_scale")
 
+        col.separator()
+        col.label(text="Camera resolution")
+        row = col.row(align=True)
+        row.prop(render, "resolution_x", text="X")
+        row.prop(render, "resolution_y", text="Y")
+        if render.resolution_y:
+            col.label(text="Aspect ratio: {:.3f}".format(
+                render.resolution_x / render.resolution_y))
+        row = col.row(align=True)
+        for preset, text in (('P916', "9:16"), ('P195', "9:19.5"),
+                             ('L169', "16:9"), ('L195', "19.5:9")):
+            op = row.operator("remote.set_resolution", text=text)
+            op.preset = preset
+        col.operator("remote.swap_resolution", icon='ARROW_LEFTRIGHT')
+
     # -- export ------------------------------------------------------------
     def _draw_export(self, layout):
         cfg = get_settings()
         box = layout.box()
         col = box.column(align=True)
         col.label(text="Export to the phone", icon='EXPORT')
+        col.prop(cfg, "send_model")
+        if not cfg.send_model:
+            return
+        col.prop(cfg, "export_mode", text="")
+        if cfg.export_mode == 'COLLECTION':
+            col.prop(cfg, "export_collection", text="")
+        col.separator()
         col.prop(cfg, "max_triangles")
         col.prop(cfg, "limit_action", text="")
         col.prop(cfg, "max_size_mb")
@@ -498,6 +598,8 @@ def _ui_refresh():
 classes = (
     SRExportSettings,
     SRCameraSettings,
+    SRResolutionOperator,
+    SRSwapResolutionOperator,
     SR_PT_status,
 )
 
