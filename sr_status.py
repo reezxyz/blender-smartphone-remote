@@ -201,8 +201,8 @@ class SRCameraSettings(bpy.types.PropertyGroup):
         default=True)
     record_max_frames: IntProperty(
         name="Max recorded frames",
-        description="Maximum length of a camera recording. The scene end "
-                    "frame is raised for the recording and restored after",
+        description="Maximum length of a camera recording, counted in scene "
+                    "frames. The scene end frame is extended if needed",
         default=3000, min=10, soft_max=20000)
     position_scale: FloatProperty(
         name="Movement scale",

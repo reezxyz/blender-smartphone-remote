@@ -70,6 +70,7 @@ class Frame():
         self.camera = camera
         self.root = root
         self.mode = 'CAMERA'
+        self.timestamp = None   # seconds, phone clock (None = old app)
 
     @classmethod
     def recv(cls,socket):
@@ -88,6 +89,9 @@ class Frame():
                     )
 
                 frame.camera = arCamera
+            elif header == b"TIME":
+                frame.timestamp = float(msgpack.unpackb(frame_buffer.pop(0))) * 1e-9
+
             elif header == b"NODE":
                 arNode = Node(
                     wm=msgpack.unpackb(frame_buffer.pop(0))

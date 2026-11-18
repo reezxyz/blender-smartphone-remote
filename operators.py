@@ -51,7 +51,8 @@ BLENDER = np.matrix([[-1, 0, 0, 0],
 
 app = None
 is_recording = False
-_saved_frame_end = None
+_rec_samples = []            # (time, frame) while recording, baked on stop
+_rec_start = 0.0             # time of the recording start
 _jump_filter = sr_status.JumpFilter()
 
 # Each job carries its OWN reply queue, so results can never be mixed up
@@ -211,6 +212,10 @@ def apply_ar_frame(frame):
     sr_status.count_frame()
     with _frame_lock:
         _pending_frame = frame
+    if is_recording and frame.mode == "CAMERA":
+        # Recording is independent of Blender's speed: every frame that
+        # arrives is stored with its time stamp, even if the viewport is slow.
+        _rec_samples.append((time.perf_counter(), frame))
 
 
 def _apply_pending_frame():
@@ -290,66 +295,150 @@ def apply_camera_pose(frame):
 
             fov = frame.camera.intrinsics[0]
             camera.data.angle = max(0.01, min(3.1, fov))
-
-            if is_recording:
-                camera.keyframe_insert(data_path="location")
-                camera.keyframe_insert(data_path="rotation_quaternion")
     except Exception as e:
         log.info("apply camera error: {}".format(e))
 
 
+def _scene_fps(scene):
+    return scene.render.fps / (scene.render.fps_base or 1.0)
+
+
 def setup_camera_animation():
-    global is_recording
+    """Start recording. Nothing is keyed now: samples are baked on stop."""
+    global is_recording, _rec_start
     scene = bpy.context.scene
 
     if scene.camera is None:
         raise RuntimeError("no active camera in the scene")
 
-    # Create and setup new action
     scene.camera.rotation_mode = 'QUATERNION'
 
     new_action = bpy.data.actions.new("camera_0")
     scene.camera.animation_data_create()
     scene.camera.animation_data.action = new_action
 
-    # Allow recordings longer than the scene range (default end = 250)
-    global _saved_frame_end
-    if _saved_frame_end is None:
-        _saved_frame_end = scene.frame_end
-    limit = int(sr_status.get_camera_settings().record_max_frames)
-    scene.frame_end = max(scene.frame_start + limit, _saved_frame_end)
-    scene.frame_current = scene.frame_start
-
-    # Launch record
-    override = get_window_override()
-    with bpy.context.temp_override(**override):
-        screen = bpy.context.screen
-        if screen is None or not screen.is_animation_playing:
-            bpy.ops.screen.animation_play()
+    del _rec_samples[:]
+    _rec_start = time.perf_counter()
     is_recording = True
+
+
+def _sample_time(frame, fallback):
+    """Time of a sample in seconds: phone clock when available."""
+    return frame.timestamp if frame.timestamp is not None else fallback
+
+
+def _build_track(samples):
+    """
+    Turns raw samples into [(t, location Vector, rotation Quaternion)].
+    Runs the jump filter in recorded time, so glitches never reach the keys.
+    """
+    use_filter = getattr(sr_status.get_camera_settings(), "reject_jumps", True)
+    jump_filter = sr_status.JumpFilter()
+    track = []
+    for received, frame in samples:
+        t = _sample_time(frame, received)
+        if use_filter:
+            rot, pos = sr_status.physical_pose(
+                frame.camera.view_matrix, frame.root.world_matrix)
+            use, _event, _dist, _ang = jump_filter.accept(rot, pos, t)
+            if not use:
+                continue
+        m = _compute_pose(frame)
+        quat = m.to_quaternion()
+        if track and track[-1][2].dot(quat) < 0:
+            quat.negate()           # keep the shortest path between samples
+        track.append((t, m.to_translation(), quat))
+    return track
+
+
+def _resample(track, fps):
+    """Samples of the track at a fixed rate: [(frame offset, loc, quat)]."""
+    if not track:
+        return []
+    t0 = track[0][0]
+    t_end = track[-1][0]
+    count = int(round((t_end - t0) * fps)) + 1
+    out = []
+    i = 0
+    for n in range(count):
+        t = t0 + n / fps
+        while i + 1 < len(track) - 1 and track[i + 1][0] < t:
+            i += 1
+        ta, la, qa = track[i]
+        if i + 1 < len(track):
+            tb, lb, qb = track[i + 1]
+            span = tb - ta
+            k = 0.0 if span <= 1e-9 else min(1.0, max(0.0, (t - ta) / span))
+        else:
+            lb, qb, k = la, qa, 0.0
+        out.append((n, la.lerp(lb, k), qa.slerp(qb, k)))
+    return out
+
+
+def _write_keys(action, start_frame, keys):
+    """Writes location / rotation_quaternion keys in one go."""
+    for path, size in (("location", 3), ("rotation_quaternion", 4)):
+        for index in range(size):
+            curve = None
+            for fc in action.fcurves:
+                if fc.data_path == path and fc.array_index == index:
+                    curve = fc
+                    break
+            if curve is None:
+                curve = action.fcurves.new(data_path=path, index=index,
+                                           action_group="Camera")
+            curve.keyframe_points.add(len(keys))
+            flat = []
+            for n, loc, quat in keys:
+                value = loc[index] if path == "location" else quat[index]
+                flat.extend((start_frame + n, value))
+            curve.keyframe_points.foreach_set("co", flat)
+            curve.update()
+
+
+def bake_recording():
+    """Resamples the recorded samples to the scene fps and keys the camera."""
+    scene = bpy.context.scene
+    samples = list(_rec_samples)
+    del _rec_samples[:]
+
+    track = _build_track(samples)
+    keys = _resample(track, _scene_fps(scene))
+    camera = scene.camera
+    if not keys or camera is None or camera.animation_data is None:
+        return 0
+
+    action = camera.animation_data.action
+    start = scene.frame_start
+    _write_keys(action, start, keys)
+    scene.frame_end = max(scene.frame_end, start + len(keys) - 1)
+    scene.frame_current = start
+    return len(keys)
 
 
 def stop_camera_animation():
     global is_recording
-
-    override = get_window_override()
-    with bpy.context.temp_override(**override):
-        screen = bpy.context.screen
-        if screen is not None and screen.is_animation_playing:
-            bpy.ops.screen.animation_cancel()
-    scene = bpy.context.scene
-    global _saved_frame_end
-    if _saved_frame_end is not None:
-        scene.frame_end = _saved_frame_end
-        _saved_frame_end = None
-    scene.frame_current = scene.frame_start
+    if not is_recording:
+        return
     is_recording = False
+    try:
+        count = bake_recording()
+        log.info("recording baked: {} frames".format(count))
+    except Exception:
+        log.exception("baking the recording failed")
 
 
 def update_camera_animation():
-    if is_recording:
-        return bpy.context.scene.frame_current
-    return "STOPPED"
+    if not is_recording:
+        return "STOPPED"
+    scene = bpy.context.scene
+    fps = _scene_fps(scene)
+    limit = int(sr_status.get_camera_settings().record_max_frames)
+    frames = int((time.perf_counter() - _rec_start) * fps)
+    if frames >= limit:
+        stop_camera_animation()
+        return "STOPPED"
+    return frames
 
 
 def record_camera(status):
@@ -661,11 +750,6 @@ def get_cached_scene(offset, chunk_size):
 '''
 
 
-def record(scene):
-    if is_recording and scene.frame_current >= (scene.frame_end - 1):
-        stop_camera_animation()
-
-
 '''
    Operators
 '''
@@ -707,9 +791,6 @@ class RemoteStartOperator(bpy.types.Operator):
 
         sr_status.set_server_running(True)
 
-        if record not in bpy.app.handlers.frame_change_post:
-            bpy.app.handlers.frame_change_post.append(record)
-
         return {'FINISHED'}
 
 
@@ -730,9 +811,6 @@ class RemoteStopOperator(bpy.types.Operator):
 
         stop_executor()
         sr_status.set_server_running(False)
-
-        if record in bpy.app.handlers.frame_change_post:
-            bpy.app.handlers.frame_change_post.remove(record)
 
         return {'FINISHED'}
 
@@ -796,9 +874,6 @@ def unregister():
         sr_status.unregister()
     except Exception:
         log.exception("status panel could not be unregistered")
-
-    if record in bpy.app.handlers.frame_change_post:
-        bpy.app.handlers.frame_change_post.remove(record)
 
     for cls in reversed(classes):
         unregister_class(cls)
